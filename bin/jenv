@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# jenv for Git Bash / MSYS2. Part of jenv-win.
+# 'use', 'deactivate', 'init' and 'exec' are handled natively (no PowerShell needed);
+# everything else is delegated to libexec/jenv-core.ps1.
+set -u
+
+bindir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(dirname "$bindir")"
+
+if command -v cygpath >/dev/null 2>&1; then
+  to_win()  { cygpath -w "$1"; }
+  to_unix() { cygpath -u "$1"; }
+else
+  to_win()  { printf '%s' "$1"; }
+  to_unix() { printf '%s' "$1"; }
+fi
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; }
+read_line()  { [ -f "$1" ] && head -n1 "$1" | tr -d '\r\n'; }
+
+# Nearest .java-version, then the global version. Sets JV / JV_SRC.
+resolve_default() {
+  local d="$PWD" v
+  while :; do
+    if [ -f "$d/.java-version" ]; then
+      v="$(read_line "$d/.java-version")"
+      if [ -n "$v" ]; then JV="$v"; JV_SRC="$d/.java-version"; return 0; fi
+    fi
+    [ "$d" = "/" ] && break
+    d="$(dirname "$d")"
+  done
+  v="$(read_line "$root/version")"
+  if [ -n "$v" ]; then JV="$v"; JV_SRC="$root/version"; return 0; fi
+  return 1
+}
+
+# Session override first (JENV_VERSION), then resolve_default.
+resolve_version() {
+  if [ -n "${JENV_VERSION:-}" ]; then JV="$JENV_VERSION"; JV_SRC="session override"; return 0; fi
+  resolve_default
+}
+
+emit_err() { printf 'echo %q >&2; false\n' "jenv: $1"; }
+
+# strip_path <PATH value> <entry>...  -> PATH value without the given entries (case-insensitive)
+strip_path() {
+  local p="$1" out="" e d drop low
+  shift
+  local IFS=':'
+  for e in $p; do
+    [ -z "$e" ] && continue
+    drop=0
+    low="${e%/}"; low="${low,,}"
+    for d in "$@"; do
+      [ -z "$d" ] && continue
+      d="${d%/}"
+      [ "$low" = "${d,,}" ] && drop=1
+    done
+    [ "$drop" -eq 0 ] && out="${out:+$out:}$e"
+  done
+  printf '%s' "$out"
+}
+
+# env_code <use|deactivate|init> [name]  -> prints shell code for the caller to eval.
+# Same rules as JenvPlan in libexec/jenv-env.ps1. Variables are kept in Windows form
+# (JAVA_HOME, JENV_BIN) so cmd, PowerShell and Git Bash can all read each other's state.
+env_code() {
+  local action="$1" name="${2:-}"
+  local active="${JENV_ACTIVE:-}" curbin_u=""
+  [ -n "${JENV_BIN:-}" ] && curbin_u="$(to_unix "$JENV_BIN")"
+
+  if [ "$action" = deactivate ]; then
+    if [ -n "$active" ]; then
+      printf 'export PATH=%q\n' "$(strip_path "$PATH" "$curbin_u")"
+      if [ -n "${JENV_ORIG_JAVA_HOME:-}" ]; then printf 'export JAVA_HOME=%q\n' "$JENV_ORIG_JAVA_HOME"
+      else echo 'unset JAVA_HOME'; fi
+    fi
+    echo 'unset JENV_VERSION JENV_ACTIVE JENV_BIN JENV_ORIG_JAVA_HOME'
+    return 0
+  fi
+
+  local sel override
+  if [ "$action" = use ] && [ -n "$name" ]; then
+    if ! valid_name "$name"; then emit_err "invalid version name '$name'."; return 0; fi
+    sel="$name"; override="$name"
+  else
+    if ! resolve_default; then
+      [ "$action" = init ] && return 0
+      emit_err "no .java-version or global version found. Use 'jenv use <name>' or 'jenv global <name>'."
+      return 0
+    fi
+    sel="$JV"; override=""
+  fi
+
+  local jdk_win jdk rest
+  jdk_win="$(read_line "$root/versions/$sel")"
+  if [ -z "$jdk_win" ]; then emit_err "version '$sel' is not registered. Run 'jenv list'."; return 0; fi
+  jdk="$(to_unix "$jdk_win")"
+  if [ ! -d "$jdk/bin" ]; then emit_err "JDK for '$sel' was not found at $jdk_win"; return 0; fi
+
+  rest="$(strip_path "$PATH" "$curbin_u" "$jdk/bin")"
+  [ -z "$active" ] && printf 'export JENV_ORIG_JAVA_HOME=%q\n' "${JAVA_HOME:-}"
+  if [ -n "$override" ]; then printf 'export JENV_VERSION=%q\n' "$override"; else echo 'unset JENV_VERSION'; fi
+  printf 'export JENV_ACTIVE=%q\n' "$sel"
+  printf 'export JENV_BIN=%q\n' "$(to_win "$jdk/bin")"
+  printf 'export JAVA_HOME=%q\n' "$jdk_win"
+  printf 'export PATH=%q\n' "$jdk/bin${rest:+:$rest}"
+}
+
+delegate() {
+  local ps
+  ps="$(command -v powershell.exe 2>/dev/null || command -v powershell 2>/dev/null || command -v pwsh 2>/dev/null || true)"
+  if [ -z "$ps" ]; then echo "jenv: PowerShell not found on PATH." >&2; exit 1; fi
+  exec "$ps" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$(to_win "$root/libexec/jenv-core.ps1")" "$@"
+}
+
+case "${1:-}" in
+  init)
+    case "${2:-}" in
+      ""|-|bash)
+        cat "$root/libexec/init.bash"
+        env_code init
+        ;;
+      *) delegate "$@" ;;
+    esac
+    ;;
+  __env)
+    shift
+    env_code "$@"
+    ;;
+  use|deactivate)
+    if [ -t 1 ]; then
+      echo "jenv: this only prints the commands. Add 'eval \"\$(command jenv init)\"' to ~/.bashrc so 'jenv $1' changes your shell." >&2
+    fi
+    env_code "$@"
+    ;;
+  exec)
+    shift
+    if [ $# -eq 0 ]; then echo "usage: jenv exec <command> [args...]" >&2; exit 1; fi
+    if ! resolve_version; then
+      echo "jenv: no Java version selected. Run 'jenv global <name>' or 'jenv local <name>'." >&2
+      exit 1
+    fi
+    jdk_win="$(read_line "$root/versions/$JV")"
+    if [ -z "$jdk_win" ]; then
+      echo "jenv: version '$JV' (set by $JV_SRC) is not registered. Run 'jenv list'." >&2
+      exit 1
+    fi
+    export JAVA_HOME="$jdk_win"
+    export PATH="$(to_unix "$jdk_win")/bin:$PATH"
+    exec "$@"
+    ;;
+  *) delegate "$@" ;;
+esac

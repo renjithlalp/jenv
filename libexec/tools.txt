@@ -1,0 +1,42 @@
+# JDK tools that get shims. Edit and run 'jenv rehash' to change.
+# A shim is only created if at least one registered JDK contains the tool.
+# kinit/klist/ktab are deliberately left out: Windows ships its own klist.exe.
+java
+javaw
+javac
+javadoc
+javap
+jar
+jarsigner
+jcmd
+jconsole
+jdb
+jdeps
+jdeprscan
+jfr
+jhsdb
+jimage
+jinfo
+jlink
+jmap
+jmod
+jpackage
+jps
+jrunscript
+jshell
+jstack
+jstat
+jstatd
+jwebserver
+keytool
+serialver
+# legacy JDK 8 tools
+appletviewer
+jjs
+jvisualvm
+native2ascii
+pack200
+rmic
+rmid
+rmiregistry
+unpack200
