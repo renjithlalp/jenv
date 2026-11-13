@@ -12,6 +12,7 @@ $BeginMark   = '# >>> jenv >>>'
 $EndMark     = '# <<< jenv <<<'
 
 . (Join-Path $LibExec 'jenv-env.ps1')
+. (Join-Path $LibExec 'jenv-winenv.ps1')
 
 # ---------------------------------------------------------------- helpers
 
@@ -371,8 +372,23 @@ function Invoke-Doctor {
     }
 
     Write-Output ''
+    Write-Output 'Windows environment (persistent USER / SYSTEM variables)'
+    $gHome = $null
+    if ($g -and $reg.ContainsKey($g)) { $gHome = $reg[$g] }
+    foreach ($w in 'Machine', 'User') {
+        $lbl = WinLabel $w
+        $jhRaw = WinGetRaw $w 'JAVA_HOME'
+        if (-not $jhRaw) { DocInfo "$lbl JAVA_HOME is not set."; continue }
+        $jhVal = [Environment]::ExpandEnvironmentVariables($jhRaw.Value)
+        if (-not (Test-Path -LiteralPath $jhVal)) { DocWarn "$lbl JAVA_HOME = $jhVal does not exist. Fix: jenv sync --$(if ($w -eq 'Machine') { 'system' } else { 'user' })"; continue }
+        if ($gHome -and ((JenvNorm $jhVal) -eq (JenvNorm $gHome))) { DocOk "$lbl JAVA_HOME = $jhVal (matches the global version '$g')" }
+        elseif ((JenvNorm $jhVal) -eq (JenvNorm $CurrentLink)) { DocOk "$lbl JAVA_HOME = $jhVal (jenv's 'current' junction)" }
+        else { DocInfo "$lbl JAVA_HOME = $jhVal (differs from global; 'jenv sync --$(if ($w -eq 'Machine') { 'system' } else { 'user' })' makes it match)" }
+    }
+
+    Write-Output ''
     Write-Output 'Shell integration'
-    $psOk = @(Get-ProfilePaths | Where-Object { Test-Block $_ }).Count -gt 0
+    $psOk =@(Get-ProfilePaths | Where-Object { Test-Block $_ }).Count -gt 0
     $bashOk = Test-Block (Join-Path $env:USERPROFILE '.bashrc')
     if ($psOk) { DocOk 'PowerShell profile loads jenv (use / deactivate / init work in PowerShell)' }
     else { DocWarn "PowerShell: 'jenv use' cannot change the session yet - run 'jenv init --install'." }
@@ -410,7 +426,12 @@ jenv-win - Java environments for cmd, PowerShell and Git Bash
   jenv deactivate              Restore PATH and JAVA_HOME from before activation
   jenv local [name|unset]      Read, write, or remove this folder's .java-version
   jenv global [name|unset]     Read, write, or clear the saved default
-  jenv current                 Show the currently activated environment
+  jenv global <name> --user|--system|--both
+                               ...and also write it to the Windows USER / SYSTEM
+                               environment variables (JAVA_HOME and the Java PATH entry)
+  jenv sync --user|--system|--both
+                               Copy the current global version into those Windows variables
+  jenv current                Show the currently activated environment
   jenv doctor                  Diagnose JDK paths and command resolution
   jenv init                    Apply local/global choice if one exists (for profiles)
 
@@ -424,8 +445,126 @@ More:
 
 Precedence: session override > nearest .java-version > saved global default.
 After changing directories, run jenv use to apply that project's version.
-Global means this manager's default, not Windows machine environment variables.
+Global means this manager's default. It only touches the Windows environment variables when
+you add --user, --system or --both (see 'jenv sync' below).
+
+Windows environment (persistent, picked up by NEW terminals and programs):
+  jenv global 17 --both        Set the global version, then JAVA_HOME + Java PATH entry in USER and SYSTEM
+  jenv sync --system           Apply the current global version to SYSTEM only (asks for admin rights)
+  jenv sync --user --no-path   Change only JAVA_HOME, leave PATH alone (jenv's shims keep choosing java)
+  jenv sync --both --whatif    Show what would change, change nothing
+  jenv sync --show             Show the current Windows JAVA_HOME / Java PATH entries
+  jenv sync --both --restore   Put back the values saved before the last change (see the backups folder)
+  Other options: --add-path (add a Java entry if PATH has none), --only-known (only touch entries that
+  belong to the old JAVA_HOME), --file <backup.json> (with --restore).
 '@ | Write-Output
+}
+
+# ---------------------------------------------------------------- Windows environment (global --user/--system, sync)
+
+function Read-WinFlags([string[]]$Items) {
+    $o = [pscustomobject]@{
+        User = $false; System = $false; NoPath = $false; AddPath = $false; Strict = $false
+        WhatIf = $false; Restore = $false; Show = $false; Elevated = $false; File = $null; Positional = @()
+    }
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $a = $Items[$i]
+        switch ($a.ToLower()) {
+            '--user'       { $o.User = $true }
+            '--system'     { $o.System = $true }
+            '--machine'    { $o.System = $true }
+            '--both'       { $o.User = $true; $o.System = $true }
+            '--no-path'    { $o.NoPath = $true }
+            '--add-path'   { $o.AddPath = $true }
+            '--only-known' { $o.Strict = $true }
+            '--whatif'     { $o.WhatIf = $true }
+            '--dry-run'    { $o.WhatIf = $true }
+            '--restore'    { $o.Restore = $true }
+            '--show'       { $o.Show = $true }
+            '--elevated'   { $o.Elevated = $true }
+            '--unset'      { $o.Positional += 'unset' }
+            '--file' {
+                if ($i + 1 -ge $Items.Count) { throw "--file needs a path." }
+                $i++
+                $o.File = $Items[$i]
+            }
+            default {
+                if ($a.StartsWith('--')) { throw "unknown option '$a'. Run 'jenv help'." }
+                $o.Positional += $a
+            }
+        }
+    }
+    if ($o.NoPath -and $o.AddPath) { throw '--no-path and --add-path cannot be combined.' }
+    return $o
+}
+
+# Applies the global version (or a backup, with --restore) to the persistent Windows environment.
+# Never returns a value: it sets $script:WinExit (0 = ok, 1 = failed).
+function Invoke-WinSync($o) {
+    $script:WinExit = 0
+    try {
+        if ($o.Show) { WinShow $Root; return }
+
+        $scopes = @()
+        if ($o.System) { $scopes += 'Machine' }
+        if ($o.User)   { $scopes += 'User' }
+        if ($scopes.Count -eq 0) { throw "choose a target: --user, --system or --both (or --show to just look)." }
+
+        $newHome = $null
+        $state = $null
+        $known = @()
+        if (-not $o.Restore) {
+            $g = JenvReadLine $GlobalFile
+            if (-not $g) { throw "no global version set. Run 'jenv global <name>' first." }
+            $newHome = Get-JdkHome $g
+            if (-not $newHome -or -not (Test-Jdk $newHome)) { throw "the global version '$g' is not usable (JDK missing at $newHome)." }
+            $newHome = $newHome.TrimEnd('\', '/')
+            $state = WinGetState
+            $known = WinKnownBins $Root $state $newHome
+            Write-Host ("Windows environment <- global version {0} ({1})" -f $g, $newHome)
+        } else {
+            Write-Host 'Restoring the Windows environment from backup'
+        }
+        $opts = [pscustomobject]@{ NoPath = $o.NoPath; AddPath = $o.AddPath; Strict = $o.Strict; WhatIf = $o.WhatIf }
+
+        # USER first: it never needs admin rights and must be written by the signed-in user.
+        if ($scopes -contains 'User') {
+            if ($o.Restore) { WinRestoreScope $Root 'User' $o.File $o.WhatIf }
+            else { WinSyncScope $Root 'User' $newHome $opts $state $known }
+        }
+
+        if ($scopes -contains 'Machine') {
+            if ((WinIsAdmin) -or $o.WhatIf) {
+                if ($o.Restore) { WinRestoreScope $Root 'Machine' $o.File $o.WhatIf }
+                else { WinSyncScope $Root 'Machine' $newHome $opts $state $known }
+            } else {
+                # The elevated copy handles ONLY the SYSTEM scope; the global version is already saved.
+                $childArgs = @('sync', '--system')
+                if ($o.Restore) { $childArgs += '--restore' }
+                if ($o.File)    { $childArgs += '--file'; $childArgs += ('"{0}"' -f $o.File) }
+                if ($o.NoPath)  { $childArgs += '--no-path' }
+                if ($o.AddPath) { $childArgs += '--add-path' }
+                if ($o.Strict)  { $childArgs += '--only-known' }
+                $childArgs += '--elevated'
+                $code = WinElevate $PSCommandPath $childArgs
+                if ($code -ne 0) { throw 'the SYSTEM update failed - see the administrator window for the reason.' }
+                Write-Host 'SYSTEM environment: updated in the administrator window.'
+            }
+        }
+
+        if ($o.WhatIf) { Write-Host '(dry run - nothing was changed)'; return }
+        if (-not $o.Restore) {
+            Write-Host 'Result'
+            WinVerify $Root $newHome
+        }
+        Write-Host 'Open a NEW terminal to see it: running terminals keep the environment they started with.'
+    } catch {
+        [Console]::Error.WriteLine('jenv: ' + $_.Exception.Message)
+        $script:WinExit = 1
+    } finally {
+        # an elevated window closes when the script ends; keep it open so the result can be read
+        if ($o.Elevated) { [void](Read-Host 'Press Enter to close this window') }
+    }
 }
 
 # ---------------------------------------------------------------- dispatch
@@ -489,19 +628,37 @@ switch ($cmd) {
     }
 
     'global' {
-        if ($rest.Count -eq 0) {
+        try { $wf = Read-WinFlags $rest } catch { Fail $_.Exception.Message }
+        $wantWin = ($wf.User -or $wf.System)
+        if ($wf.Positional.Count -gt 1) { Fail "usage: jenv global [name|unset] [--user|--system|--both]" }
+        if ($wf.Positional.Count -eq 0) {
+            if ($wantWin) { Fail "usage: jenv global <name> --user|--system|--both  (or 'jenv sync' to apply the current global)" }
             $g = JenvReadLine $GlobalFile
             if ($g) { Write-Output $g } else { Fail "no global version set. Use 'jenv global <name>'." }
-        } elseif ($rest[0] -eq 'unset' -or $rest[0] -eq '--unset') {
+        } elseif ($wf.Positional[0] -eq 'unset') {
+            if ($wantWin) { Fail "'jenv global unset' does not change the Windows variables. Use 'jenv sync --restore --user|--system|--both' to put back saved values." }
             if (Test-Path -LiteralPath $GlobalFile) { Remove-Item -LiteralPath $GlobalFile -Force }
             Update-Current $null
             Write-Output 'Global version unset.'
         } else {
-            Assert-Registered $rest[0]
-            Write-Text $GlobalFile ($rest[0] + "`n")
-            Update-Current (Get-JdkHome $rest[0])
-            Write-Output ("Global version is now {0} ({1})" -f $rest[0], (Get-JdkHome $rest[0]))
+            $name = $wf.Positional[0]
+            Assert-Registered $name
+            Write-Text $GlobalFile ($name + "`n")
+            Update-Current (Get-JdkHome $name)
+            Write-Output ("Global version is now {0} ({1})" -f $name, (Get-JdkHome $name))
+            if ($wantWin) {
+                Write-Output ''
+                Invoke-WinSync $wf
+                if ($script:WinExit -ne 0) { exit $script:WinExit }
+            }
         }
+    }
+
+    'sync' {
+        try { $wf = Read-WinFlags $rest } catch { Fail $_.Exception.Message }
+        if ($wf.Positional.Count -gt 0) { Fail "'jenv sync' takes no version name (it uses the global version). Try: jenv global <name> --both" }
+        Invoke-WinSync $wf
+        exit $script:WinExit
     }
 
     'local' {

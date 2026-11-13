@@ -18,6 +18,10 @@ jenv use                     Clear override and activate nearest local/global ch
 jenv deactivate              Restore PATH and JAVA_HOME from before activation
 jenv local [name|unset]      Read, write, or remove this folder's .java-version
 jenv global [name|unset]     Read, write, or clear the saved default
+jenv global <name> --user|--system|--both
+                             ...and also write it to the Windows USER / SYSTEM variables
+jenv sync --user|--system|--both
+                             Copy the current global version into the Windows variables
 jenv current                 Show the currently activated environment
 jenv doctor                  Diagnose JDK paths and command resolution
 jenv init                    Apply local/global choice if one exists (for profiles)
@@ -32,7 +36,46 @@ jenv init --install|--remove Add/remove jenv in your PowerShell and Git Bash pro
 
 Precedence: **session override** (`jenv use <name>`) > **nearest `.java-version`** (`jenv local`) > **saved global default** (`jenv global`).
 After changing directories, run `jenv use` to apply that project's version to `JAVA_HOME` and `PATH`.
-"Global" means this manager's default, not Windows machine environment variables.
+"Global" means this manager's default. It only touches the Windows environment variables when you add
+`--user`, `--system` or `--both` (next section).
+
+## Changing the Windows (USER / SYSTEM) environment variables
+
+Normally jenv leaves your Windows environment alone. When you want the *real, persistent* `JAVA_HOME` and Java
+`PATH` entry changed too (for services, IDEs started from the Start menu, other users' tools, ...), add a scope:
+
+```
+jenv global 17 --both          # set the global version, then update USER and SYSTEM
+jenv global 17 --user          # USER only (no admin needed)
+jenv sync --system             # apply the CURRENT global version to SYSTEM only
+jenv sync --user --no-path     # change JAVA_HOME only, leave PATH untouched
+jenv sync --both --whatif      # dry run: show exactly what would change
+jenv sync --show               # what the Windows variables contain right now
+jenv sync --both --restore     # put back the values saved before the last change
+```
+
+What it does, per scope:
+
+- **JAVA_HOME** is set to the JDK folder of the global version.
+- **PATH**: the first Java entry (`%JAVA_HOME%\bin`, the old JDK's `bin`, or any other folder holding `java.exe`,
+  such as Oracle's `javapath`) is replaced *in place* by the new JDK's `bin`, and other Java entries are removed.
+  If it was written as `%JAVA_HOME%\bin` it stays that way. Every other PATH entry is left exactly as it was.
+  Windows system folders are never touched. If PATH has no Java entry nothing is added (jenv's shims already
+  resolve `java`) unless you pass `--add-path`.
+- **SYSTEM** needs administrator rights: jenv opens one UAC prompt and runs only the SYSTEM part in an
+  administrator window. The USER part always runs as you.
+- **Safety:** the old `JAVA_HOME` and `PATH` of each scope are saved to `backups\backup-<time>-user|system.json`
+  before anything is written (`--restore` uses the newest, or `--file <backup.json>`). PATH is written with the
+  registry API and kept as an expandable value, so long PATHs are not truncated (unlike `setx`) and `%VARS%` survive.
+- **When it takes effect:** new terminals and programs only. A terminal that is already open keeps the environment it
+  started with; use `jenv use` there if you need the change immediately.
+- **Both scopes:** if USER and SYSTEM both define `JAVA_HOME`, the USER value wins for you, so use `--both` (or
+  `--user`) when you want your terminals to change. jenv prints a warning if the result would not take effect.
+- **Shims and `.java-version`:** if a real Java folder sits on PATH before jenv's shims, `java` will always be that JDK and a
+  project's `.java-version` is ignored for `java`/`javac`. Use `--no-path` to change only `JAVA_HOME` and keep the
+  shims in charge.
+- Other options: `--only-known` (only touch PATH entries that belong to the old `JAVA_HOME`), `--file <backup.json>`
+  (with `--restore`). `jenv doctor` also compares the Windows `JAVA_HOME` values with the global version.
 
 ## Install
 
